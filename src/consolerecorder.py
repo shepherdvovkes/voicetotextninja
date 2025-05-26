@@ -11,111 +11,43 @@ import tempfile
 import os
 from dotenv import load_dotenv
 from select import select
+from rich.live import Live
+from rich.panel import Panel
+from rich.console import Console
+from rich.layout import Layout
+from rich.text import Text
+from rich import box
+import shutil
 
-# === CONFIG ===
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = 'int16'
-CHUNK_SEC = 0.5
-RECORD_TIMEOUT = 10   # max sec
-SILENCE_TIMEOUT = 3   # auto-stop after 3 sec silence
+CHUNK_SEC = 10
 VAD_LEVEL = 2
+SILENCE_TIMEOUT = 3
 
-# === INIT ===
 vad = webrtcvad.Vad(VAD_LEVEL)
 q = queue.Queue()
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# === LOGGING ===
-def log_event(event):
-    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-    print(f"[{ts}] {event}")
+console = Console()
 
-# === AUDIO CALLBACK ===
 def audio_callback(indata, frames, time_info, status):
     if status:
-        log_event(f"Status: {status}")
+        debug_log.append(f"[Status] {status}")
     q.put(indata.copy())
 
-# === VU METER ===
-def compute_vu(pcm):
-    rms = np.sqrt(np.mean(np.square(pcm.astype(np.float32))))
-    db = 20 * np.log10(rms + 1e-8)
-    return np.clip((db + 50) / 50, 0, 1)
-
-# === CORRECT VAD HANDLING ===
 def vad_activity(chunk_bytes, sample_rate):
-    # 30 ms = 480 samples = 960 bytes for 16kHz, int16
     frame_size = int(0.03 * sample_rate) * 2
-    speech_detected = False
     for i in range(0, len(chunk_bytes), frame_size):
         frame = chunk_bytes[i:i+frame_size]
         if len(frame) == frame_size:
             if vad.is_speech(frame, sample_rate):
-                speech_detected = True
-                break
-    return speech_detected
+                return True
+    return False
 
-# === AUDIO RECORDER ===
-def record_audio():
-    frames = []
-    vad_timeout = None
-    total_sec = 0
-    silence_sec = 0
-    max_time = RECORD_TIMEOUT
-
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, callback=audio_callback, blocksize=int(CHUNK_SEC*SAMPLE_RATE)):
-        log_event("Запись начата. Enter — остановить, Ctrl+C — выйти.")
-        print_progress(0, max_time, 0, 0, True)
-        t0 = time.time()
-        while True:
-            try:
-                chunk = q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            frames.append(chunk)
-            pcm = chunk.flatten()
-            vu = compute_vu(pcm)
-            bar = "█" * int(vu * 20) + "-" * (20 - int(vu * 20))
-            speech = vad_activity(chunk.tobytes(), SAMPLE_RATE)
-            if speech:
-                silence_sec = 0
-                vad_timeout = time.time()
-            else:
-                if vad_timeout:
-                    silence_sec = time.time() - vad_timeout
-            total_sec = time.time() - t0
-            print_progress(total_sec, max_time, vu, speech, False, bar=bar, silence_sec=silence_sec)
-            if silence_sec >= SILENCE_TIMEOUT:
-                log_event(f"Тишина {SILENCE_TIMEOUT} сек, автостоп.")
-                break
-            if total_sec >= max_time:
-                log_event("Достигнут лимит времени, автостоп.")
-                break
-            # Stop immediately if Enter is pressed
-            if sys.stdin in select([sys.stdin], [], [], 0)[0]:
-                _ = sys.stdin.readline()
-                log_event("Enter — остановка записи.")
-                break
-    log_event("Запись остановлена.")
-    audio = np.concatenate(frames, axis=0)
-    return audio
-
-def print_progress(current, total, vu, speech, new, bar="", silence_sec=0):
-    secs = int(current)
-    sil = f" | Тишина: {silence_sec:.1f}s" if silence_sec else ""
-    speech_ind = "🎤" if speech else "  "
-    msg = f"\r[{secs:2d}/{int(total)}s] [{bar}] VU:{vu:.2f} {speech_ind}{sil}    "
-    if new:
-        print()
-    sys.stdout.write(msg)
-    sys.stdout.flush()
-
-# === OPENAI WHISPER RECOGNITION ===
 def recognize_audio(audio_array, sample_rate=16000):
-    import tempfile
-    import wave
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         with wave.open(tf.name, 'wb') as wf:
             wf.setnchannels(1)
@@ -129,25 +61,139 @@ def recognize_audio(audio_array, sample_rate=16000):
                 file=f,
                 response_format="text"
             )
-    return text
+    return text, tf.name
 
-# === MAIN LOOP ===
+def save_text(text, basename):
+    fname = basename.replace('.wav', '.txt')
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(text.strip())
+    return fname
+
+def split_sentences(text):
+    import re
+    return re.split(r'(?<=[.?!])\s+', text.strip())
+
+def make_layout(dictation_text, debug_log, prompt_message):
+    layout = Layout()
+    layout.split_column(
+        Layout(name="upper", ratio=3),
+        Layout(name="middle", ratio=1),
+        Layout(name="lower", size=4)
+    )
+    layout["upper"].update(
+        Panel(
+            Text(dictation_text, style="bold white on blue"),
+            title="📝 Dictation",
+            box=box.ROUNDED,
+            padding=(1,1)
+        )
+    )
+    layout["middle"].update(
+        Panel(
+            Text("\n".join(debug_log[-14:]), style="yellow"),
+            title="⚙️ Debug Log",
+            box=box.ROUNDED,
+            padding=(0,1)
+        )
+    )
+    layout["lower"].update(
+        Panel(
+            Text(prompt_message, style="bold magenta"),
+            title="📢 Prompt / Status",
+            box=box.ROUNDED
+        )
+    )
+    return layout
+
+def record_and_recognize_session():
+    global dictation_text, debug_log, prompt_message
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, callback=audio_callback, blocksize=int(SAMPLE_RATE * 0.5)):
+        try:
+            while True:
+                frames = []
+                vad_timeout = None
+                silence_sec = 0
+                t0 = time.time()
+                prompt_message = "[green]Говорите! (до 10 сек или пауза >3 сек)[/green]"
+                speech_active = False
+                with Live(make_layout(dictation_text, debug_log, prompt_message), refresh_per_second=20, screen=True) as live:
+                    while True:
+                        now = time.time()
+                        elapsed = now - t0
+                        if elapsed >= CHUNK_SEC:
+                            break
+                        try:
+                            chunk = q.get(timeout=0.05)
+                        except queue.Empty:
+                            continue
+                        frames.append(chunk)
+                        speech = vad_activity(chunk.tobytes(), SAMPLE_RATE)
+                        speech_active = bool(speech)
+                        if speech:
+                            silence_sec = 0
+                            vad_timeout = time.time()
+                        else:
+                            if vad_timeout:
+                                silence_sec = time.time() - vad_timeout
+                        debug_log.append(
+                            f"[{int(elapsed):2d}s] {'🎤' if speech else '  '} | Silence: {silence_sec:.1f}s"
+                        )
+                        if silence_sec >= SILENCE_TIMEOUT:
+                            debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Silence {SILENCE_TIMEOUT}s: fragment end.")
+                            break
+                        prompt_message = "[green]Говорите! (до 10 сек или пауза >3 сек)[/green]"
+                        live.update(make_layout(dictation_text, debug_log, prompt_message))
+                    audio = np.concatenate(frames, axis=0)
+                    debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Fragment recorded. Sending to Whisper...")
+                    prompt_message = "[yellow]Обработка...[/yellow]"
+                    live.update(make_layout(dictation_text, debug_log, prompt_message))
+                    try:
+                        text, wavfile = recognize_audio(audio)
+                    except Exception as e:
+                        debug_log.append(f"Recognition error: {e}")
+                        text = ""
+                        wavfile = ""
+                    if text.strip():
+                        dictation_text += ("\n" if dictation_text else "") + text.strip()
+                        save_text(text, wavfile)
+                        debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Saved: {wavfile.replace('.wav','.txt')}")
+                    else:
+                        debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] No text recognized.")
+                    prompt_message = "[cyan]Готово! Говорите следующий фрагмент или Enter — стоп, Ctrl+C — выход.[/cyan]"
+                    live.update(make_layout(dictation_text, debug_log, prompt_message))
+                    time.sleep(1.2)
+                    debug_log.append("---- Next fragment ----")
+                # После выхода из Live (по break) обновим панели с новой подсказкой
+                prompt_message = "[magenta]Говорите следующий фрагмент или Enter — стоп, Ctrl+C — выход.[/magenta]"
+                with Live(make_layout(dictation_text, debug_log, prompt_message), refresh_per_second=12, screen=True) as live:
+                    time.sleep(1)
+                # Прервать, если пользователь нажал Enter
+                if sys.stdin in select([sys.stdin], [], [], 0)[0]:
+                    _ = sys.stdin.readline()
+                    debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] Enter — stop session.")
+                    break
+        except KeyboardInterrupt:
+            debug_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] KeyboardInterrupt (Exit).")
+            prompt_message = "[red]Завершено пользователем.[/red]"
+            with Live(make_layout(dictation_text, debug_log, prompt_message), refresh_per_second=12, screen=True):
+                time.sleep(2)
+
 def main():
-    log_event("Готово к записи. Нажмите Enter для старта, Ctrl+C для выхода.")
-    try:
-        while True:
-            input(">>> Enter — начать запись")
-            audio = record_audio()
-            print("\nАудио записано. Отправляем в OpenAI...")
-            try:
-                text = recognize_audio(audio)
-                print("\n===== Распознанный текст =====\n")
-                print(text.strip())
-                print("\n==============================\n")
-            except Exception as e:
-                print("Ошибка распознавания:", e)
-    except KeyboardInterrupt:
-        print("\nВыход.")
+    global dictation_text, debug_log, prompt_message
+    dictation_text = ""
+    debug_log = []
+    prompt_message = "[bold green]Готово к диктовке. Говорите фрагментами по 10 секунд. Enter — стоп, Ctrl+C — выход.[/bold green]"
+    console.clear()
+    with Live(make_layout(dictation_text, debug_log, prompt_message), refresh_per_second=12, screen=True):
+        time.sleep(2)
+    record_and_recognize_session()
+    prompt_message = "[bold blue]Диктовка завершена. Смотрите результат ниже![/bold blue]"
+    with Live(make_layout(dictation_text, debug_log, prompt_message), refresh_per_second=12, screen=True):
+        time.sleep(5)
+    console.print(Panel(Text(dictation_text, style="bold white on blue"), title="📝 Итоговая диктовка"))
 
 if __name__ == "__main__":
+    dictation_text = ""
+    debug_log = []
+    prompt_message = ""
     main()
