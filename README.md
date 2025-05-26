@@ -27,7 +27,7 @@
 
 4. Запусти диктовщик:
     ```bash
-    python consolerecorder_no_vu.py
+    python consolerecorder.py
     ```
 
 ## Как пользоваться
